@@ -1,0 +1,142 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-flink}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-flink}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Pure cache — safe to evict under memory pressure. See REDIS.md.
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_CACHE_PORT:-6379}:6379"
+    volumes:
+      - redis-cache-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Session, geo, and BullMQ queue data — must never be evicted. See REDIS.md.
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "${REDIS_QUEUE_PORT:-6380}:6379"
+    volumes:
+      - redis-queue-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override the host-oriented values from .env — inside the compose network the app
+      # reaches Postgres/Redis by service name, not localhost.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-flink}?schema=public
+      REDIS_CACHE_URL: redis://redis-cache:6379
+      REDIS_QUEUE_URL: redis://redis-queue:6379
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    # Uses the HEALTHCHECK baked into the image (Dockerfile hits GET /health).
+
+  # BullMQ job processor — its own process/container so a slow or stuck job can't starve the
+  # API server's event loop. Same image as `app`, different entrypoint. See REDIS.md.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-flink}?schema=public
+      REDIS_CACHE_URL: redis://redis-cache:6379
+      REDIS_QUEUE_URL: redis://redis-queue:6379
+    command: ["node", "dist/queues/worker.js"]
+    # The image's baked-in HEALTHCHECK probes GET /health, which only the `app` process serves —
+    # disable it here rather than have this container report a permanently false "unhealthy".
+    healthcheck:
+      disable: true
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  # One-off helper to apply Prisma migrations against the dockerized Postgres:
+  #   docker compose run --rm migrate
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-flink}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["npx", "prisma", "migrate", "deploy"]
+
+  # DB browser UI. Not started by default: `docker compose --profile tools up adminer`
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    profiles: ["tools"]
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Queue dashboard. Not started by default: `docker compose --profile tools up bull-board`
+  bull-board:
+    image: deadly0/bull-board:latest
+    restart: unless-stopped
+    profiles: ["tools"]
+    ports:
+      - "${BULL_BOARD_PORT:-3001}:3000"
+    environment:
+      REDIS_HOST: redis-queue
+      REDIS_PORT: 6379
+    depends_on:
+      redis-queue:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-cache-data:
+  redis-queue-data:

@@ -1,0 +1,14 @@
+req
+1. User onboarding 
+ . name, phone, gender, email
+ . OTP verification
+
+2. Save user's home location with lat/long
+3. Optional info of property 
+ . home type(Apartment/independent house/villa/studio) 
+ . Home Size 1bhk/2bhk/3bhk/4+bhk/multifloor
+ . Members living in home i.e. Adults, Children, Senior citizen
+ . Female at home
+ . Pet at home
+
+4.  

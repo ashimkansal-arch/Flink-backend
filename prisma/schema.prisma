@@ -1,0 +1,1281 @@
+// Flink domain schema — see /Users/ashimkansal/.claude/plans/parallel-swimming-crayon.md for the
+// full P0 plan this was generated from, and the LLD it's translated from.
+//
+// Translation notes (also in the plan doc):
+// - Every `CHECK (col IN (...))` in the source DDL becomes a Prisma enum. Open-ended
+//   documented-but-unconstrained columns (e.g. BookingTrackingEvent.eventType) stay plain String.
+// - `_paise BIGINT` money columns are Prisma BigInt.
+// - Primary keys are `@default(uuid())`, not `gen_random_uuid()` — no pgcrypto extension needed.
+// - Two things the DDL has that Prisma's schema DSL can't express, added by hand-editing the
+//   generated migration SQL instead: the partial unique index on Assignment (only one `accepted`
+//   assignment per booking, but multiple non-accepted ones for the offer-fallback flow), and
+//   numeric CHECK constraints (ReviewRating.rating 1-5, ProviderAvailability.dayOfWeek 0-6).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ── Enums ──────────────────────────────────────────────────────────────────
+
+enum UserStatus {
+  active
+  blocked
+  deleted
+}
+
+enum UserRole {
+  customer
+}
+
+enum Gender {
+  male
+  female
+  other
+}
+
+enum OtpPurpose {
+  login
+  signup
+}
+
+enum HomeType {
+  apartment
+  independent_house
+  villa
+  studio
+}
+
+enum HomeSize {
+  bhk_1      @map("1bhk")
+  bhk_2      @map("2bhk")
+  bhk_3      @map("3bhk")
+  bhk_4_plus @map("4bhk_plus")
+}
+
+enum PetType {
+  dog
+  cat
+  bird
+  fish
+  other
+}
+
+enum ProviderOnboardingStatus {
+  registered
+  profile_complete
+  docs_submitted
+  background_check
+  training
+  active
+  rejected
+  suspended
+}
+
+enum ProviderStatus {
+  active
+  inactive
+  suspended
+  deleted
+}
+
+enum SupervisorStatus {
+  active
+  inactive
+  suspended
+  deleted
+}
+
+enum DocumentType {
+  id_proof
+  address_proof
+  certification
+  bank_proof
+}
+
+enum VerificationStatus {
+  pending
+  approved
+  rejected
+}
+
+enum OfflineRequestStatus {
+  pending
+  approved
+  rejected
+  cancelled
+}
+
+enum BookingType {
+  instant
+  scheduled
+}
+
+enum BookingStatus {
+  draft
+  confirmed
+  searching
+  assigned
+  no_provider
+  en_route
+  in_progress
+  completed
+  disputed
+  paid
+  cancelled
+}
+
+enum SessionCompletionOutcome {
+  completed
+  ended_early
+}
+
+// Shared by Booking.cancelledBy and AuditLog.actorType (both need all four values).
+enum ActorType {
+  customer
+  provider
+  admin
+  system
+}
+
+enum AssignmentStatus {
+  offered
+  accepted
+  declined
+  expired
+  completed
+  cancelled
+}
+
+enum PaymentMethod {
+  card
+  upi
+  wallet
+  netbanking
+}
+
+enum PaymentStatus {
+  pending
+  captured
+  failed
+  refunded
+  partially_refunded
+}
+
+enum RefundStatus {
+  pending
+  processed
+  rejected
+}
+
+enum WalletTxnType {
+  credit
+  debit
+}
+
+enum WalletTxnSource {
+  referral
+  refund
+  support_credit
+  booking_payment
+  topup
+}
+
+enum ReferralStatus {
+  pending
+  credited
+  expired
+}
+
+enum PayoutStatus {
+  pending
+  processed
+  failed
+}
+
+enum PayoutBatchStatus {
+  draft
+  approved
+  processing
+  completed
+  failed
+}
+
+enum AdminUserStatus {
+  pending
+  active
+  disabled
+}
+
+/** CRM visibility/ops scope — independent of role permissions (PRD §4). */
+enum AccessScopeLevel {
+  global
+  business_unit
+  city
+  zone
+  team
+  assigned
+  self
+}
+
+/** Visibility policy levels (Unified Spec §5.2). */
+enum VisibilityLevel {
+  global
+  city
+  team
+  team_and_children
+  scope
+  assigned
+  custom
+}
+
+enum PolicyStatus {
+  active
+  inactive
+  draft
+}
+
+enum OrgTeamStatus {
+  active
+  inactive
+}
+
+enum CouponDiscountType {
+  percent
+  flat
+}
+
+// Not the same as ActorType (no "system") — used only by Notification.recipientType.
+enum RecipientType {
+  customer
+  provider
+  admin
+}
+
+enum NotificationChannel {
+  push
+  sms
+  email
+  in_app
+}
+
+enum NotificationStatus {
+  queued
+  sent
+  failed
+  read
+}
+
+// ── Users & Identity ─────────────────────────────────────────────────────
+
+model User {
+  id                 String     @id @default(uuid()) @map("user_id") @db.Uuid
+  phoneNumber        String     @unique @map("phone_number") @db.VarChar(15)
+  fullName           String?    @map("full_name") @db.VarChar(120)
+  gender             Gender?
+  email              String?    @db.VarChar(160)
+  role               UserRole   @default(customer)
+  isPhoneVerified    Boolean    @default(false) @map("is_phone_verified")
+  profileImageUrl    String?    @map("profile_image_url")
+  referralCode       String     @unique @map("referral_code") @db.VarChar(20)
+  referredByCode     String?    @map("referred_by_code") @db.VarChar(20)
+  walletBalancePaise BigInt     @default(0) @map("wallet_balance_paise")
+  fcmToken           String?    @map("fcm_token") @db.VarChar(512)
+  status             UserStatus @default(active)
+  deletedAt          DateTime?  @map("deleted_at")
+  createdAt          DateTime   @default(now()) @map("created_at")
+  updatedAt          DateTime   @updatedAt @map("updated_at")
+
+  homeProfile        HomeProfile?
+  addresses          Address[]
+  bookings           Booking[]
+  reviews            ReviewRating[]
+  payments           Payment[]
+  walletTransactions WalletTransaction[]
+  referralsMade      Referral[]          @relation("ReferralsMade")
+  referralsReceived  Referral[]          @relation("ReferralsReceived")
+
+  @@map("users")
+}
+
+model OtpVerification {
+  id           String     @id @default(uuid()) @map("otp_id") @db.Uuid
+  phoneNumber  String     @map("phone_number") @db.VarChar(15)
+  otpCodeHash  String     @map("otp_code_hash") @db.VarChar(255)
+  purpose      OtpPurpose
+  expiresAt    DateTime   @map("expires_at")
+  isUsed       Boolean    @default(false) @map("is_used")
+  attemptCount Int        @default(0) @map("attempt_count")
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  @@index([phoneNumber, purpose], map: "idx_otp_phone_purpose")
+  @@map("otp_verifications")
+}
+
+// Home profile (Screen 2B)
+model HomeProfile {
+  id              String    @id @default(uuid()) @map("home_profile_id") @db.Uuid
+  userId          String    @unique @map("user_id") @db.Uuid
+  homeType        HomeType? @map("home_type")
+  homeSize        HomeSize? @map("home_size")
+  floorNumber     Int?      @map("floor_number")
+  adultsCount     Int       @default(0) @map("adults_count")
+  childrenCount   Int       @default(0) @map("children_count")
+  seniorsCount    Int       @default(0) @map("seniors_count")
+  hasFemaleMember Boolean   @default(true) @map("has_female_member")
+  liveSelfieUrl   String?   @map("live_selfie_url") // captured only if hasFemaleMember = false
+  hasPets         Boolean   @default(false) @map("has_pets")
+  petType         PetType?  @map("pet_type")
+  petCount        Int?      @default(0) @map("pet_count")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("home_profiles")
+}
+
+model Address {
+  id               String   @id @default(uuid()) @map("address_id") @db.Uuid
+  userId           String   @map("user_id") @db.Uuid
+  label            String?  @default("Home") @db.VarChar(30)
+  line1            String
+  line2            String?
+  city             String?  @db.VarChar(80)
+  state            String?  @db.VarChar(80)
+  pincode          String?  @db.VarChar(10)
+  formattedAddress String?  @map("formatted_address")
+  latitude         Float
+  longitude        Float
+  isDefault        Boolean  @default(false) @map("is_default")
+  isServiceable    Boolean  @default(true) @map("is_serviceable")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@index([userId], map: "idx_addresses_user")
+  @@index([latitude, longitude], map: "idx_addresses_geo")
+  @@map("addresses")
+}
+
+// ── Service Providers ────────────────────────────────────────────────────
+
+model ServiceProvider {
+  id                     String                   @id @default(uuid()) @map("provider_id") @db.Uuid
+  phoneNumber            String                   @unique @map("phone_number") @db.VarChar(15)
+  // Nullable, diverging from the DDL's NOT NULL: the provider state machine's own
+  // REGISTERED -> PROFILE_COMPLETE transition implies the name isn't known until profile setup,
+  // but a ServiceProvider row is created at REGISTERED (on first OTP verify).
+  fullName               String?                  @map("full_name") @db.VarChar(120)
+  gender                 Gender?
+  email                  String?                  @db.VarChar(160)
+  profilePhotoUrl        String?                  @map("profile_photo_url")
+  bio                    String?
+  onboardingStatus       ProviderOnboardingStatus @default(registered) @map("onboarding_status")
+  rejectionReason        String?                  @map("rejection_reason")
+  serviceCategories      String[]                 @default([]) @map("service_categories")
+  referralCode           String                   @unique @map("referral_code") @db.VarChar(20)
+  coverageZoneId         String?                  @map("coverage_zone_id") @db.Uuid
+  currentLatitude        Float?                   @map("current_latitude")
+  currentLongitude       Float?                   @map("current_longitude")
+  locationUpdatedAt      DateTime?                @map("location_updated_at")
+  avgRating              Decimal                  @default(5.00) @map("avg_rating") @db.Decimal(3, 2)
+  totalJobsCompleted     Int                      @default(0) @map("total_jobs_completed")
+  acceptanceRate         Decimal                  @default(100.00) @map("acceptance_rate") @db.Decimal(5, 2)
+  isAvailable            Boolean                  @default(false) @map("is_available")
+  stripeConnectAccountId String?                  @map("stripe_connect_account_id") @db.VarChar(120)
+  bankAccountLast4       String?                  @map("bank_account_last4") @db.VarChar(4)
+  status                 ProviderStatus           @default(inactive)
+  deviceInfo             Json?                    @map("device_info")
+  fcmToken               String?                  @map("fcm_token") @db.VarChar(512)
+  registeredBySupervisorId String?              @map("registered_by_supervisor_id") @db.Uuid
+  registeredByAdminId    String?                @map("registered_by_admin_id") @db.Uuid
+  deletedAt              DateTime?                @map("deleted_at")
+  createdAt              DateTime                 @default(now()) @map("created_at")
+  updatedAt              DateTime                 @updatedAt @map("updated_at")
+
+  coverageZone    CoverageZone?            @relation(fields: [coverageZoneId], references: [id])
+  registeredBySupervisor Supervisor?         @relation("ProviderRegisteredBy", fields: [registeredBySupervisorId], references: [id], onDelete: SetNull)
+  registeredByAdmin      AdminUser?          @relation("ProviderRegisteredByAdmin", fields: [registeredByAdminId], references: [id], onDelete: SetNull)
+  kycDocuments       ProviderKycDocument[]
+  offlineRequests    ProviderOfflineRequest[]
+  availability    ProviderAvailability[]
+  trainingModules ProviderTrainingModule[]
+  assignments     Assignment[]
+  trackingEvents  BookingTrackingEvent[]
+  reviews         ReviewRating[]
+  payouts         Payout[]
+
+  @@index([onboardingStatus, status], map: "idx_providers_status")
+  @@index([currentLatitude, currentLongitude], map: "idx_providers_geo")
+  @@index([coverageZoneId], map: "idx_providers_zone")
+  @@index([registeredBySupervisorId], map: "idx_providers_registered_by_supervisor")
+  @@index([registeredByAdminId], map: "idx_providers_registered_by_admin")
+  @@map("service_providers")
+}
+
+model ProviderKycDocument {
+  id                 String             @id @default(uuid()) @map("document_id") @db.Uuid
+  providerId         String             @map("provider_id") @db.Uuid
+  documentType       DocumentType       @map("document_type")
+  s3Key              String             @map("s3_key")
+  verificationStatus VerificationStatus @default(pending) @map("verification_status")
+  reviewedBy         String?            @map("reviewed_by") @db.Uuid
+  reviewedBySupervisorId String?        @map("reviewed_by_supervisor_id") @db.Uuid
+  reviewedAt         DateTime?          @map("reviewed_at")
+  rejectionReason    String?            @map("rejection_reason")
+  uploadedAt         DateTime           @default(now()) @map("uploaded_at")
+
+  provider               ServiceProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  reviewedByAdmin        AdminUser?      @relation(fields: [reviewedBy], references: [id])
+  reviewedBySupervisor   Supervisor?     @relation("ProviderKycDocumentReviewedBySupervisor", fields: [reviewedBySupervisorId], references: [id])
+
+  @@unique([providerId, documentType])
+  @@index([providerId], map: "idx_provider_kyc_docs_provider")
+  @@map("provider_kyc_documents")
+}
+
+model ProviderOfflineRequest {
+  id               String               @id @default(uuid()) @map("offline_request_id") @db.Uuid
+  providerId       String               @map("provider_id") @db.Uuid
+  reason           String               @db.VarChar(500)
+  status           OfflineRequestStatus @default(pending)
+  requestedLat     Float?               @map("requested_lat")
+  requestedLong    Float?               @map("requested_long")
+  reviewedByAdminId String?             @map("reviewed_by_admin_id") @db.Uuid
+  reviewedAt       DateTime?            @map("reviewed_at")
+  rejectionReason  String?              @map("rejection_reason") @db.VarChar(500)
+  createdAt        DateTime             @default(now()) @map("created_at")
+  updatedAt        DateTime             @updatedAt @map("updated_at")
+
+  provider         ServiceProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  reviewedByAdmin  AdminUser?      @relation(fields: [reviewedByAdminId], references: [id])
+
+  @@index([status, createdAt(sort: Desc)], map: "idx_provider_offline_requests_status")
+  @@index([providerId, status], map: "idx_provider_offline_requests_provider")
+  @@map("provider_offline_requests")
+}
+
+model ProviderAvailability {
+  id          String    @id @default(uuid()) @map("availability_id") @db.Uuid
+  providerId  String    @map("provider_id") @db.Uuid
+  dayOfWeek   Int       @map("day_of_week") // 0-6, CHECK added via migration hand-edit
+  startTime   DateTime  @map("start_time") @db.Time
+  endTime     DateTime  @map("end_time") @db.Time
+  isBlocked   Boolean   @default(false) @map("is_blocked") // blocked date/time off
+  blockedDate DateTime? @map("blocked_date") @db.Date
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  provider ServiceProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId], map: "idx_provider_availability_provider")
+  @@map("provider_availability")
+}
+
+model ProviderTrainingModule {
+  id          String    @id @default(uuid()) @map("module_id") @db.Uuid
+  providerId  String    @map("provider_id") @db.Uuid
+  moduleName  String    @map("module_name") @db.VarChar(80)
+  isCompleted Boolean   @default(false) @map("is_completed")
+  completedAt DateTime? @map("completed_at")
+
+  provider ServiceProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("provider_training_modules")
+}
+
+model CoverageZone {
+  id             String    @id @default(uuid()) @map("zone_id") @db.Uuid
+  zoneName       String    @map("zone_name") @db.VarChar(80)
+  zoneType       String    @map("zone_type") @db.VarChar(80)
+  boundaryMode   String    @default("radius") @map("boundary_mode") @db.VarChar(20)
+  city           String?   @db.VarChar(80)
+  state          String?   @db.VarChar(80)
+  address        String?   @db.VarChar(500)
+  centerLat      Float?    @map("center_lat")
+  centerLng      Float?    @map("center_lng")
+  radiusKm       Float?    @map("radius_km")
+  radiusMeters   Int?      @map("radius_meters")
+  polygonGeojson Json?     @map("polygon_geojson") // { points: [{ lat, lng }] } or GeoJSON
+  isActive       Boolean   @default(true) @map("is_active")
+  launchedAt     DateTime? @map("launched_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  providers ServiceProvider[]
+
+  @@map("coverage_zones")
+}
+
+model CoverageZoneType {
+  id        String   @id @default(uuid()) @map("zone_type_id") @db.Uuid
+  name      String   @unique @db.VarChar(80)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("coverage_zone_types")
+}
+
+// ── Services & Categories ────────────────────────────────────────────────
+
+model ServiceCategory {
+  id            String   @id @default(uuid()) @map("category_id") @db.Uuid
+  name          String   @db.VarChar(80) // Sweeping, Bathroom Cleaning, Laundry...
+  slug          String   @unique @db.VarChar(80)
+  description   String?
+  iconUrl       String?  @map("icon_url")
+  includedTasks String[] @default([]) @map("included_tasks")
+  excludedTasks String[] @default([]) @map("excluded_tasks")
+  isActive       Boolean  @default(true) @map("is_active")
+  pricePaise     BigInt?  @map("price_paise")
+  sessionMinutes Int?     @map("session_minutes")
+  displayOrder   Int      @default(0) @map("display_order")
+  parentId       String?  @map("parent_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  parent       ServiceCategory?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
+  children     ServiceCategory[] @relation("CategoryHierarchy")
+  planServices ServicePlanService[]
+  addons       ServiceAddon[]
+  bookings     Booking[]
+  supervisors  Supervisor[]
+  adminUsers   AdminUser[]
+
+  @@index([parentId], map: "idx_service_categories_parent")
+  @@map("service_categories")
+}
+
+model Supervisor {
+  id                    String           @id @default(uuid()) @map("supervisor_id") @db.Uuid
+  fullName              String           @map("full_name") @db.VarChar(120)
+  email                 String           @unique @db.VarChar(160)
+  phoneNumber           String           @unique @map("phone_number") @db.VarChar(15)
+  passwordHash          String           @map("password_hash") @db.VarChar(255)
+  passwordResetRequired Boolean          @default(true) @map("password_reset_required")
+  categoryId            String           @map("category_id") @db.Uuid
+  status                SupervisorStatus @default(active)
+  createdBy             String           @map("created_by") @db.Uuid
+  assignedToId          String?          @map("assigned_to") @db.Uuid
+  createdAt             DateTime         @default(now()) @map("created_at")
+  updatedAt             DateTime         @updatedAt @map("updated_at")
+
+  category            ServiceCategory   @relation(fields: [categoryId], references: [id])
+  createdByAdmin      AdminUser         @relation("SupervisorCreatedBy", fields: [createdBy], references: [id])
+  assignedToAdmin     AdminUser?        @relation("SupervisorAssignedTo", fields: [assignedToId], references: [id])
+  registeredProviders ServiceProvider[] @relation("ProviderRegisteredBy")
+  reviewedProviderKycDocuments ProviderKycDocument[] @relation("ProviderKycDocumentReviewedBySupervisor")
+
+  @@index([categoryId], map: "idx_supervisors_category")
+  @@index([createdBy], map: "idx_supervisors_created_by")
+  @@index([assignedToId], map: "idx_supervisors_assigned_to")
+  @@map("supervisors")
+}
+
+model ServicePlan {
+  id              String   @id @default(uuid()) @map("plan_id") @db.Uuid
+  name            String   @db.VarChar(80)
+  slug            String   @unique @db.VarChar(80)
+  description     String?
+  pricePaise      BigInt   @map("price_paise")
+  includedTasks   String[] @default([]) @map("included_tasks")
+  excludedTasks   String[] @default([]) @map("excluded_tasks")
+  durationMinutes Int      @default(60) @map("duration_minutes")
+  isActive        Boolean  @default(true) @map("is_active")
+  displayOrder    Int      @default(0) @map("display_order")
+
+  services ServicePlanService[]
+  bookings Booking[]
+
+  @@map("service_plans")
+}
+
+model ServicePlanService {
+  planId     String @map("plan_id") @db.Uuid
+  categoryId String @map("category_id") @db.Uuid
+
+  plan     ServicePlan     @relation(fields: [planId], references: [id], onDelete: Cascade)
+  category ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@id([planId, categoryId])
+  @@index([categoryId], map: "idx_service_plan_services_category")
+  @@map("service_plan_services")
+}
+
+model ServiceAddon {
+  id                String  @id @default(uuid()) @map("addon_id") @db.Uuid
+  categoryId        String  @map("category_id") @db.Uuid
+  name              String  @db.VarChar(80) // "Others"
+  pricePaise        BigInt  @map("price_paise") // 4900
+  requiresTextInput Boolean @default(false) @map("requires_text_input")
+
+  category ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@map("service_addons")
+}
+
+// ── Bookings, Assignments, Jobs ──────────────────────────────────────────
+
+model Booking {
+  id                   String        @id @default(uuid()) @map("booking_id") @db.Uuid
+  customerId           String        @map("customer_id") @db.Uuid
+  addressId            String        @map("address_id") @db.Uuid
+  categoryId           String        @map("category_id") @db.Uuid
+  planId               String?       @map("plan_id") @db.Uuid
+  serviceIds           String[]      @default([]) @map("service_ids")
+  addonIds             String[]      @default([]) @map("addon_ids")
+  addonNotes           String?       @map("addon_notes")
+  bookingType          BookingType   @map("booking_type")
+  scheduledDate        DateTime?     @map("scheduled_date") @db.Date
+  scheduledStartTime   DateTime?     @map("scheduled_start_time") @db.Time
+  status               BookingStatus @default(draft)
+  sessionOtpHash       String?       @map("session_otp_hash") @db.VarChar(255) // 4-digit OTP shared to start session
+  sessionOtp           String?       @map("session_otp") @db.VarChar(4)
+  couponCode           String?       @map("coupon_code") @db.VarChar(20)
+  discountPaise        BigInt        @default(0) @map("discount_paise")
+  basePricePaise       BigInt        @map("base_price_paise")
+  addonPricePaise      BigInt        @default(0) @map("addon_price_paise")
+  overtimeRatePaise    Int           @default(200) @map("overtime_rate_paise") // ₹2/min after slot ends
+  overtimeMinutes      Int           @default(0) @map("overtime_minutes")
+  totalPricePaise      BigInt        @map("total_price_paise")
+  cancellationFeePaise BigInt?       @default(0) @map("cancellation_fee_paise")
+  cancelledBy          ActorType?    @map("cancelled_by")
+  cancellationReason   String?       @map("cancellation_reason")
+  startedAt                   DateTime?                  @map("started_at")
+  completedAt                 DateTime?                  @map("completed_at")
+  sessionMinutes              Int?                       @map("session_minutes")
+  sessionChecklist            Json                       @default("[]") @map("session_checklist")
+  completionSelfieUrl         String?                    @map("completion_selfie_url")
+  completionPhotoUrl          String?                    @map("completion_photo_url")
+  customerCompletedAt         DateTime?                  @map("customer_completed_at")
+  customerCompletionOutcome   SessionCompletionOutcome?  @map("customer_completion_outcome")
+  completedBy                 ActorType?                 @map("completed_by")
+  slaDeadlineAt        DateTime?     @map("sla_deadline_at") // for SLA monitor
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  customer       User                   @relation(fields: [customerId], references: [id])
+  address        Address                @relation(fields: [addressId], references: [id])
+  category       ServiceCategory        @relation(fields: [categoryId], references: [id])
+  plan           ServicePlan?           @relation(fields: [planId], references: [id])
+  assignments    Assignment[]
+  trackingEvents BookingTrackingEvent[]
+  review         ReviewRating?
+  payments       Payment[]
+
+  @@index([customerId], map: "idx_bookings_customer")
+  @@index([status], map: "idx_bookings_status")
+  @@index([slaDeadlineAt], map: "idx_bookings_sla")
+  @@map("bookings")
+}
+
+model Assignment {
+  id            String           @id @default(uuid()) @map("assignment_id") @db.Uuid
+  bookingId     String           @map("booking_id") @db.Uuid
+  providerId    String           @map("provider_id") @db.Uuid
+  offerSequence Int              @default(1) @map("offer_sequence") // 1st offer, 2nd offer... (fallback attempts)
+  offerScore    Decimal?         @map("offer_score") @db.Decimal(6, 2)
+  status        AssignmentStatus @default(offered)
+  offeredAt     DateTime         @default(now()) @map("offered_at")
+  respondedAt   DateTime?        @map("responded_at")
+  expiresAt     DateTime         @map("expires_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+
+  booking  Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  provider ServiceProvider @relation(fields: [providerId], references: [id])
+
+  // NOTE: the source DDL also has a partial unique index —
+  //   CREATE UNIQUE INDEX idx_assignments_active ON assignments(booking_id) WHERE status = 'accepted';
+  // — added by hand-editing the generated migration.sql (no Prisma schema DSL equivalent). A plain
+  // @@unique([bookingId]) here would be wrong: it would forbid multiple non-accepted offers per
+  // booking, breaking the offer-fallback flow.
+  @@index([bookingId], map: "idx_assignments_booking")
+  @@index([providerId], map: "idx_assignments_provider")
+  @@map("assignments")
+}
+
+model BookingTrackingEvent {
+  id         String   @id @default(uuid()) @map("event_id") @db.Uuid
+  bookingId  String   @map("booking_id") @db.Uuid
+  providerId String?  @map("provider_id") @db.Uuid
+  eventType  String   @map("event_type") @db.VarChar(24) // 'location_update','arrived','started','completed'
+  latitude   Float?
+  longitude  Float?
+  metadata   Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  booking  Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  provider ServiceProvider? @relation(fields: [providerId], references: [id])
+
+  @@index([bookingId, createdAt], map: "idx_tracking_booking")
+  @@map("booking_tracking_events")
+}
+
+// ── Reviews & Ratings ────────────────────────────────────────────────────
+
+model ReviewRating {
+  id         String   @id @default(uuid()) @map("review_id") @db.Uuid
+  bookingId  String   @unique @map("booking_id") @db.Uuid
+  customerId String   @map("customer_id") @db.Uuid
+  providerId String   @map("provider_id") @db.Uuid
+  rating     Int // 1-5, CHECK added via migration hand-edit
+  comment    String?
+  tags       String[] @default([])
+  imageUrl   String?  @map("image_url")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  booking  Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  customer User            @relation(fields: [customerId], references: [id])
+  provider ServiceProvider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId], map: "idx_reviews_provider")
+  @@map("reviews_ratings")
+}
+
+// ── Coupons ──────────────────────────────────────────────────────────────
+
+model Coupon {
+  id             String              @id @default(uuid()) @map("coupon_id") @db.Uuid
+  code           String              @unique @db.VarChar(20)
+  description    String              @db.VarChar(120)
+  discountType   CouponDiscountType  @map("discount_type")
+  percentOff     Int?                @map("percent_off")
+  amountOffPaise BigInt?             @map("amount_off_paise")
+  maxUses        Int                 @map("max_uses")
+  usedCount      Int                 @default(0) @map("used_count")
+  isActive       Boolean             @default(true) @map("is_active")
+  expiresAt      DateTime            @map("expires_at") @db.Date
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+
+  @@index([isActive], map: "idx_coupons_active")
+  @@map("coupons")
+}
+
+// ── Payments, Wallet, Payouts ────────────────────────────────────────────
+
+model Payment {
+  id                    String         @id @default(uuid()) @map("payment_id") @db.Uuid
+  bookingId             String         @map("booking_id") @db.Uuid
+  customerId            String         @map("customer_id") @db.Uuid
+  stripePaymentIntentId String?        @map("stripe_payment_intent_id") @db.VarChar(120)
+  amountPaise           BigInt         @map("amount_paise")
+  platformFeePaise      BigInt         @map("platform_fee_paise") // e.g. 20% of amount
+  providerPayoutPaise   BigInt         @map("provider_payout_paise") // e.g. 80% of amount
+  paymentMethod         PaymentMethod? @map("payment_method")
+  status                PaymentStatus  @default(pending)
+  capturedAt            DateTime?      @map("captured_at")
+  createdAt             DateTime       @default(now()) @map("created_at")
+
+  booking  Booking  @relation(fields: [bookingId], references: [id])
+  customer User     @relation(fields: [customerId], references: [id])
+  refunds  Refund[]
+
+  @@index([bookingId], map: "idx_payments_booking")
+  @@index([customerId], map: "idx_payments_customer")
+  @@map("payments")
+}
+
+model Refund {
+  id          String       @id @default(uuid()) @map("refund_id") @db.Uuid
+  paymentId   String       @map("payment_id") @db.Uuid
+  amountPaise BigInt       @map("amount_paise")
+  reason      String?
+  approvedBy  String?      @map("approved_by") @db.Uuid
+  status      RefundStatus @default(pending)
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  payment         Payment    @relation(fields: [paymentId], references: [id])
+  approvedByAdmin AdminUser? @relation(fields: [approvedBy], references: [id])
+
+  @@map("refunds")
+}
+
+model WalletTransaction {
+  id                String          @id @default(uuid()) @map("wallet_txn_id") @db.Uuid
+  userId            String          @map("user_id") @db.Uuid
+  type              WalletTxnType
+  source            WalletTxnSource
+  amountPaise       BigInt          @map("amount_paise")
+  balanceAfterPaise BigInt          @map("balance_after_paise")
+  referenceId       String?         @map("reference_id") @db.Uuid // booking_id / referral_id / refund_id — polymorphic, not a real FK
+  createdAt         DateTime        @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt], map: "idx_wallet_txn_user")
+  @@map("wallet_transactions")
+}
+
+model Referral {
+  id             String         @id @default(uuid()) @map("referral_id") @db.Uuid
+  referrerUserId String         @map("referrer_user_id") @db.Uuid
+  referredUserId String?        @map("referred_user_id") @db.Uuid
+  referralCode   String         @map("referral_code") @db.VarChar(20)
+  bonusPaise     BigInt         @default(15000) @map("bonus_paise") // ₹150
+  status         ReferralStatus @default(pending)
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  referrer User  @relation("ReferralsMade", fields: [referrerUserId], references: [id])
+  referred User? @relation("ReferralsReceived", fields: [referredUserId], references: [id])
+
+  @@map("referrals")
+}
+
+model Payout {
+  id               String       @id @default(uuid()) @map("payout_id") @db.Uuid
+  providerId       String       @map("provider_id") @db.Uuid
+  stripeTransferId String?      @map("stripe_transfer_id") @db.VarChar(120)
+  amountPaise      BigInt       @map("amount_paise")
+  batchId          String?      @map("batch_id") @db.Uuid
+  status           PayoutStatus @default(pending)
+  periodStart      DateTime?    @map("period_start") @db.Date
+  periodEnd        DateTime?    @map("period_end") @db.Date
+  processedAt      DateTime?    @map("processed_at")
+  createdAt        DateTime     @default(now()) @map("created_at")
+
+  provider ServiceProvider @relation(fields: [providerId], references: [id])
+  batch    PayoutBatch?    @relation(fields: [batchId], references: [id])
+
+  @@index([providerId], map: "idx_payouts_provider")
+  @@map("payouts")
+}
+
+model PayoutBatch {
+  id               String            @id @default(uuid()) @map("batch_id") @db.Uuid
+  scheduledFor     DateTime          @map("scheduled_for") @db.Date
+  totalAmountPaise BigInt            @default(0) @map("total_amount_paise")
+  providerCount    Int               @default(0) @map("provider_count")
+  status           PayoutBatchStatus @default(draft)
+  approvedBy       String?           @map("approved_by") @db.Uuid
+  createdAt        DateTime          @default(now()) @map("created_at")
+
+  approvedByAdmin AdminUser? @relation(fields: [approvedBy], references: [id])
+  payouts         Payout[]
+
+  @@map("payout_batches")
+}
+
+// ── Admin Users & RBAC ───────────────────────────────────────────────────
+
+model AdminRole {
+  id          String   @id @default(uuid()) @map("role_id") @db.Uuid
+  roleName    String   @unique @map("role_name") @db.VarChar(60)
+  name        String   @db.VarChar(80)
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  isAdmin     Boolean  @default(false) @map("is_admin")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  adminUsers      AdminUser[]
+  rolePermissions RolePermission[]
+  roleModules     RoleModule[]
+
+  @@map("admin_roles")
+}
+
+model AdminModule {
+  id          String   @id @default(uuid()) @map("module_id") @db.Uuid
+  name        String   @db.VarChar(80)
+  slug        String   @unique @db.VarChar(80)
+  sectionName String   @map("section_name") @db.VarChar(80)
+  sectionSlug String   @map("section_slug") @db.VarChar(80)
+  path        String   @db.VarChar(120)
+  icon        String   @default("Layers") @db.VarChar(80)
+  displayOrder Int      @default(0) @map("display_order")
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  roleModules RoleModule[]
+
+  @@index([sectionSlug], map: "idx_admin_modules_section")
+  @@index([sectionSlug, displayOrder], map: "idx_admin_modules_order")
+  @@unique([path], map: "admin_modules_path_key")
+  @@map("admin_modules")
+}
+
+model RoleModule {
+  roleId   String @map("role_id") @db.Uuid
+  moduleId String @map("module_id") @db.Uuid
+
+  role   AdminRole   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  module AdminModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, moduleId])
+  @@map("role_modules")
+}
+
+model AdminPermission {
+  id            String  @id @default(uuid()) @map("permission_id") @db.Uuid
+  permissionKey String  @unique @map("permission_key") @db.VarChar(60) // 'bookings:read', 'providers:approve'
+  description   String?
+
+  rolePermissions RolePermission[]
+  userPermissions AdminUserPermission[]
+
+  @@map("admin_permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       AdminRole       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission AdminPermission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model AdminUserPermission {
+  adminUserId  String @map("admin_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  adminUser  AdminUser       @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  permission AdminPermission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([adminUserId, permissionId])
+  @@map("admin_user_permissions")
+}
+
+model AdminAddress {
+  id           String   @id @default(uuid()) @map("admin_address_id") @db.Uuid
+  adminUserId  String   @unique @map("admin_id") @db.Uuid
+  country      String   @default("India") @db.VarChar(80)
+  state        String?  @db.VarChar(80)
+  city         String?  @db.VarChar(80)
+  addressLine1 String?  @map("address_line_1") @db.VarChar(200)
+  addressLine2 String?  @map("address_line_2") @db.VarChar(200)
+  pincode      String?  @db.VarChar(10)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@map("admin_addresses")
+}
+
+model AdminUser {
+  id                    String           @id @default(uuid()) @map("admin_id") @db.Uuid
+  email                 String           @unique @db.VarChar(160)
+  fullName              String?          @map("full_name") @db.VarChar(120)
+  phoneNumber           String?          @unique @map("phone_number") @db.VarChar(15)
+  passwordHash          String?          @map("password_hash") @db.VarChar(255)
+  roleId                String           @map("role_id") @db.Uuid
+  status                AdminUserStatus  @default(active)
+  passwordResetRequired Boolean          @default(true) @map("password_reset_required")
+  invitedBy             String?          @map("invited_by") @db.Uuid
+  inviteTokenHash       String?          @map("invite_token_hash") @db.VarChar(255)
+  inviteExpiresAt       DateTime?        @map("invite_expires_at")
+  lastLoginAt           DateTime?        @map("last_login_at")
+  scopeLevel            AccessScopeLevel @default(global) @map("scope_level")
+  scopeBusinessUnit     String?          @map("scope_business_unit") @db.VarChar(80)
+  scopeCityIds          String[]         @default([]) @map("scope_city_ids")
+  scopeZoneIds          String[]         @default([]) @map("scope_zone_ids")
+  categoryId            String?          @map("category_id") @db.Uuid
+  assignedToId          String?          @map("assigned_to") @db.Uuid
+  createdAt             DateTime         @default(now()) @map("created_at")
+  updatedAt             DateTime         @updatedAt @map("updated_at")
+
+  role                AdminRole             @relation(fields: [roleId], references: [id])
+  invitedByAdmin      AdminUser?            @relation("AdminUserInvites", fields: [invitedBy], references: [id])
+  invitedAdmins       AdminUser[]           @relation("AdminUserInvites")
+  assignedTo          AdminUser?            @relation("AdminUserAssignedTo", fields: [assignedToId], references: [id])
+  assignedMembers     AdminUser[]           @relation("AdminUserAssignedTo")
+  category            ServiceCategory?      @relation(fields: [categoryId], references: [id])
+  permissions         AdminUserPermission[]
+  address             AdminAddress?
+  reviewedKycDocs           ProviderKycDocument[]
+  reviewedOfflineRequests   ProviderOfflineRequest[]
+  approvedRefunds     Refund[]
+  approvedBatches     PayoutBatch[]
+  createdSupervisors  Supervisor[]          @relation("SupervisorCreatedBy")
+  assignedSupervisors Supervisor[]          @relation("SupervisorAssignedTo")
+  registeredProviders ServiceProvider[]     @relation("ProviderRegisteredByAdmin")
+  teamMemberships     TeamMember[]
+
+  @@index([roleId], map: "idx_admin_users_role")
+  @@index([scopeLevel], map: "idx_admin_users_scope_level")
+  @@index([categoryId], map: "idx_admin_users_category")
+  @@index([assignedToId], map: "idx_admin_users_assigned_to")
+  @@map("admin_users")
+}
+
+// ── Access Control: org teams & policies (Super Admin) ───────────────────
+
+model OrgTeam {
+  id           String        @id @default(uuid()) @map("team_id") @db.Uuid
+  name         String        @db.VarChar(120)
+  code         String        @unique @db.VarChar(40)
+  parentTeamId String?       @map("parent_team_id") @db.Uuid
+  cityIds      String[]      @default([]) @map("city_ids")
+  zoneIds      String[]      @default([]) @map("zone_ids")
+  status       OrgTeamStatus @default(active)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  parent   OrgTeam?     @relation("OrgTeamHierarchy", fields: [parentTeamId], references: [id])
+  children OrgTeam[]    @relation("OrgTeamHierarchy")
+  members  TeamMember[]
+  policy   TeamPolicy?
+
+  @@index([parentTeamId], map: "idx_org_teams_parent")
+  @@index([status], map: "idx_org_teams_status")
+  @@map("org_teams")
+}
+
+model TeamMember {
+  id          String   @id @default(uuid()) @map("team_member_id") @db.Uuid
+  teamId      String   @map("team_id") @db.Uuid
+  adminUserId String   @map("admin_user_id") @db.Uuid
+  isPrimary   Boolean  @default(true) @map("is_primary")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  team      OrgTeam   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, adminUserId])
+  @@index([adminUserId], map: "idx_team_members_admin")
+  @@map("team_members")
+}
+
+model VisibilityPolicy {
+  id        String          @id @default(uuid()) @map("visibility_policy_id") @db.Uuid
+  name      String          @unique @db.VarChar(120)
+  level     VisibilityLevel
+  config    Json?
+  status    PolicyStatus    @default(active)
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+
+  teamPolicies TeamPolicy[]
+
+  @@index([status], map: "idx_visibility_policies_status")
+  @@map("visibility_policies")
+}
+
+model ApprovalPolicy {
+  id                   String       @id @default(uuid()) @map("approval_policy_id") @db.Uuid
+  name                 String       @unique @db.VarChar(120)
+  actionKey            String       @map("action_key") @db.VarChar(80)
+  thresholdPaise       BigInt?      @map("threshold_paise")
+  approverRoleNames    String[]     @default([]) @map("approver_role_names")
+  escalationRoleNames  String[]     @default([]) @map("escalation_role_names")
+  config               Json?
+  status               PolicyStatus @default(active)
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  teamPolicies TeamPolicy[]
+
+  @@index([actionKey], map: "idx_approval_policies_action")
+  @@index([status], map: "idx_approval_policies_status")
+  @@map("approval_policies")
+}
+
+model WorkflowPolicy {
+  id          String       @id @default(uuid()) @map("workflow_policy_id") @db.Uuid
+  name        String       @unique @db.VarChar(120)
+  version     Int          @default(1)
+  steps       Json         @default("[]")
+  transitions Json         @default("[]")
+  status      PolicyStatus @default(draft)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  teamPolicies TeamPolicy[]
+
+  @@index([status], map: "idx_workflow_policies_status")
+  @@map("workflow_policies")
+}
+
+model SlaPolicy {
+  id                  String       @id @default(uuid()) @map("sla_policy_id") @db.Uuid
+  name                String       @unique @db.VarChar(120)
+  metricKey           String       @map("metric_key") @db.VarChar(80)
+  targetMinutes       Int          @map("target_minutes")
+  escalateAfterMinutes Int?        @map("escalate_after_minutes")
+  escalationRoleNames String[]     @default([]) @map("escalation_role_names")
+  config              Json?
+  status              PolicyStatus @default(active)
+  createdAt           DateTime     @default(now()) @map("created_at")
+  updatedAt           DateTime     @updatedAt @map("updated_at")
+
+  teamPolicies TeamPolicy[]
+
+  @@index([metricKey], map: "idx_sla_policies_metric")
+  @@index([status], map: "idx_sla_policies_status")
+  @@map("sla_policies")
+}
+
+model TeamPolicy {
+  id                  String   @id @default(uuid()) @map("team_policy_id") @db.Uuid
+  teamId              String   @unique @map("team_id") @db.Uuid
+  visibilityPolicyId  String?  @map("visibility_policy_id") @db.Uuid
+  approvalPolicyId    String?  @map("approval_policy_id") @db.Uuid
+  workflowPolicyId    String?  @map("workflow_policy_id") @db.Uuid
+  slaPolicyId         String?  @map("sla_policy_id") @db.Uuid
+  overrides           Json?
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  team             OrgTeam           @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  visibilityPolicy VisibilityPolicy? @relation(fields: [visibilityPolicyId], references: [id])
+  approvalPolicy   ApprovalPolicy?   @relation(fields: [approvalPolicyId], references: [id])
+  workflowPolicy   WorkflowPolicy?   @relation(fields: [workflowPolicyId], references: [id])
+  slaPolicy        SlaPolicy?        @relation(fields: [slaPolicyId], references: [id])
+
+  @@map("team_policies")
+}
+
+// ── Geo reference (countries / states / cities) ───────────────────────────
+
+model Country {
+  id        String   @id @default(uuid()) @map("country_id") @db.Uuid
+  name      String   @unique @db.VarChar(80)
+  code      String   @unique @db.VarChar(3)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  states State[]
+
+  @@map("countries")
+}
+
+model State {
+  id        String   @id @default(uuid()) @map("state_id") @db.Uuid
+  countryId String   @map("country_id") @db.Uuid
+  name      String   @db.VarChar(80)
+  code      String?  @db.VarChar(10)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  country Country @relation(fields: [countryId], references: [id], onDelete: Cascade)
+  cities  City[]
+
+  @@unique([countryId, name])
+  @@index([countryId], map: "idx_states_country")
+  @@map("states")
+}
+
+model City {
+  id        String   @id @default(uuid()) @map("city_id") @db.Uuid
+  stateId   String   @map("state_id") @db.Uuid
+  name      String   @db.VarChar(80)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  state State @relation(fields: [stateId], references: [id], onDelete: Cascade)
+
+  @@unique([stateId, name])
+  @@index([stateId], map: "idx_cities_state")
+  @@map("cities")
+}
+
+// ── Audit Log & Notifications ────────────────────────────────────────────
+
+model AuditLog {
+  id         String    @id @default(uuid()) @map("audit_id") @db.Uuid
+  actorType  ActorType @map("actor_type")
+  actorId    String?   @map("actor_id") @db.Uuid
+  action     String    @db.VarChar(80) // 'provider.approve', 'booking.override_status'
+  entityType String?   @map("entity_type") @db.VarChar(40)
+  entityId   String?   @map("entity_id") @db.Uuid
+  metadata   Json?
+  ipAddress  String?   @map("ip_address") @db.VarChar(45)
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([entityType, entityId], map: "idx_audit_entity")
+  @@index([actorType, actorId], map: "idx_audit_actor")
+  @@map("audit_logs")
+}
+
+model NotificationCampaign {
+  id               String    @id @default(uuid()) @map("campaign_id") @db.Uuid
+  title            String    @db.VarChar(80)
+  body             String    @db.VarChar(240)
+  category         String    @db.VarChar(20)
+  tone             String    @db.VarChar(20)
+  audience         String    @db.VarChar(20)
+  recipientCount   Int       @default(0) @map("recipient_count")
+  createdByAdminId String    @map("created_by_admin_id") @db.Uuid
+  readAt           DateTime? @map("read_at")
+  archivedAt       DateTime? @map("archived_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  @@index([createdAt(sort: Desc)], map: "idx_notification_campaigns_created")
+  @@map("notification_campaigns")
+}
+
+model Notification {
+  id            String              @id @default(uuid()) @map("notification_id") @db.Uuid
+  recipientType RecipientType       @map("recipient_type")
+  recipientId   String              @map("recipient_id") @db.Uuid
+  channel       NotificationChannel
+  templateKey   String              @map("template_key") @db.VarChar(60) // 'booking.confirmed', 'provider.assigned'
+  payload       Json?
+  status        NotificationStatus  @default(queued)
+  sentAt        DateTime?           @map("sent_at")
+  readAt        DateTime?           @map("read_at")
+  createdAt     DateTime            @default(now()) @map("created_at")
+
+  @@index([recipientType, recipientId, createdAt(sort: Desc)], map: "idx_notifications_recipient")
+  @@map("notifications")
+}
+
+// ── Platform configuration (singleton) ───────────────────────────────────
+
+/** Global ops settings — single row with id = "default". */
+model PlatformConfig {
+  id                       String   @id @default("default") @db.VarChar(32)
+  providerKycUploadEnabled Boolean  @default(true) @map("provider_kyc_upload_enabled")
+  jobHoursStart            String   @default("09:00") @map("job_hours_start") @db.VarChar(5)
+  jobHoursEnd              String   @default("20:00") @map("job_hours_end") @db.VarChar(5)
+  updatedAt                DateTime @updatedAt @map("updated_at")
+  updatedByAdminId         String?  @map("updated_by_admin_id") @db.Uuid
+
+  @@map("platform_config")
+}
+
+/** Public legal/help copy shown on customer and provider login — singleton id = "default". */
+model LegalSupportContent {
+  id               String   @id @default("default") @db.VarChar(32)
+  termsOfService   String   @default("") @map("terms_of_service")
+  privacyPolicy    String   @default("") @map("privacy_policy")
+  refundPolicy     String   @default("") @map("refund_policy")
+  cancellationPolicy String @default("") @map("cancellation_policy")
+  pricingAndPayment String  @default("") @map("pricing_and_payment")
+  contactEmail     String?  @map("contact_email") @db.VarChar(160)
+  contactPhone     String?  @map("contact_phone") @db.VarChar(20)
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  updatedByAdminId String?  @map("updated_by_admin_id") @db.Uuid
+
+  faqs LegalSupportFaq[]
+
+  @@map("legal_support_content")
+}
+
+model LegalSupportFaq {
+  id        String   @id @default(uuid()) @map("faq_id") @db.Uuid
+  contentId String   @default("default") @map("content_id") @db.VarChar(32)
+  question  String   @db.VarChar(240)
+  answer    String
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  content LegalSupportContent @relation(fields: [contentId], references: [id], onDelete: Cascade)
+
+  @@index([contentId, sortOrder], map: "idx_legal_support_faqs_order")
+  @@map("legal_support_faqs")
+}
